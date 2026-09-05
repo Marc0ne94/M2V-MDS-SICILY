@@ -1,0 +1,119 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0c0c0b;
+  --color-surface: #151513;
+  --color-elevated: #1c1c18;
+  --color-fg: #eceae4;
+  --color-muted: #9a978c;
+  --color-subtle: #6e6b62;
+  --color-border: #2a2a26;
+  --color-accent: #d7d3c4;
+  --color-accent-fg: #0c0c0b;
+  --color-mark-store: #eceae4;
+  --color-mark-hub: #c45c4a;
+  --color-mark-aff: #8a9a8a;
+  --color-paper: #e8e4d8;
+  --color-ink: #121210;
+  --font-display: "Newsreader", "Iowan Old Style", Georgia, serif;
+  --font-sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  html,
+  body,
+  #app {
+    min-height: 100%;
+    background: var(--color-bg);
+    color: var(--color-fg);
+  }
+  body {
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+    font-family: var(--font-display);
+  }
+  p {
+    text-wrap: pretty;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+.leaflet-container {
+  background: #c5c1b0;
+  font-family: var(--font-sans);
+}
+.leaflet-container.is-aerial {
+  background: #1a1c14;
+}
+.leaflet-control-attribution {
+  background: color-mix(in oklab, var(--color-bg) 80%, transparent) !important;
+  color: var(--color-subtle) !important;
+  font-size: 10px !important;
+}
+.leaflet-control-attribution a {
+  color: var(--color-muted) !important;
+}
+.leaflet-bar a {
+  background: var(--color-elevated) !important;
+  color: var(--color-fg) !important;
+  border-bottom-color: var(--color-border) !important;
+}
+.leaflet-bar a:hover {
+  background: var(--color-surface) !important;
+}
+
+.atlas-icon {
+  background: transparent !important;
+  border: none !important;
+}
+.atlas-pin {
+  width: 14px;
+  height: 14px;
+  display: block;
+  border-radius: 999px;
+  border: 2px solid #121210;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 40%);
+}
+.atlas-pin.is-hub {
+  width: 18px;
+  height: 18px;
+  background: var(--color-mark-hub);
+}
+.atlas-pin.is-store {
+  background: var(--color-mark-store);
+}
+.atlas-pin.is-aff {
+  background: var(--color-mark-aff);
+}
+.atlas-pin.is-fed {
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-mark-hub) 55%, transparent);
+}
+.is-aerial .atlas-pin {
+  border-color: #eceae4;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 70%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
