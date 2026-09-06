@@ -2,6 +2,16 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { getSql } from "@/lib/db";
 
+function haversineKm(aLat: number, aLon: number, bLat: number, bLon: number) {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLon = toRad(bLon - aLon);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
 export type SiteListItem = {
   id: number;
   code: string;
@@ -36,6 +46,10 @@ export type SiteListItem = {
   status: string;
   servedByHubSlug: string | null;
   servedByHubLabel: string | null;
+  giftCard: boolean;
+  flags: string[];
+  sourceCount: number;
+  kmFromHub: number | null;
 };
 
 export type AtlasSource = {
@@ -44,6 +58,7 @@ export type AtlasSource = {
   url: string | null;
   publishedOn: string | null;
   kind: string;
+  siteCount: number;
 };
 
 export type LogisticsHub = {
@@ -79,6 +94,39 @@ export type LogisticsFlow = {
   blurb: string | null;
 };
 
+export type SiteRelation = {
+  siteA: number;
+  siteB: number;
+  kind: string;
+  note: string | null;
+};
+
+export type AtlasEra = {
+  slug: string;
+  label: string;
+  startedOn: string | null;
+  endedOn: string | null;
+  blurb: string | null;
+};
+
+export type Coverage = {
+  sites: number;
+  stores: number;
+  warehouses: number;
+  giftCard: number;
+  verified: number;
+  probable: number;
+  approximate: number;
+  withPhone: number;
+  withOpenedOn: number;
+  withArea: number;
+  withPartner: number;
+  unoEx: number;
+  postGiftcard: number;
+  sourceLinks: number;
+  sources: number;
+};
+
 export type AtlasPayload = {
   network: {
     brandName: string;
@@ -104,9 +152,13 @@ export type AtlasPayload = {
   }[];
   events: { siteId: number; occurredOn: string | null; title: string; body: string | null }[];
   sources: AtlasSource[];
-  siteSources: { siteId: number; sourceSlug: string }[];
+  siteSources: { siteId: number; sourceSlug: string; role: string }[];
   hubs: LogisticsHub[];
   flows: LogisticsFlow[];
+  flags: { siteId: number; flag: string; note: string | null }[];
+  relations: SiteRelation[];
+  eras: AtlasEra[];
+  coverage: Coverage;
 };
 
 export const loadAtlas = createServerFn({ method: "GET" }).handler(
@@ -157,6 +209,7 @@ export const loadAtlas = createServerFn({ method: "GET" }).handler(
       status: string;
       served_by_hub: string | null;
       served_by_hub_label: string | null;
+      gift_card: boolean;
     }>`
       select
         s.id, s.code, s.kind_slug, k.label as kind_label,
@@ -168,7 +221,8 @@ export const loadAtlas = createServerFn({ method: "GET" }).handler(
         s.opened_on::text as opened_on, s.area_sqm, s.parking_spots, s.staff_count,
         s.notes, s.confidence_slug, conf.label as confidence_label,
         s.osm_url, s.map_preview_url, s.status,
-        s.served_by_hub, h.label as served_by_hub_label
+        s.served_by_hub, h.label as served_by_hub_label,
+        s.gift_card
       from sites s
       join site_kinds k on k.slug = s.kind_slug
       join ownership_kinds o on o.slug = s.ownership_slug
@@ -241,14 +295,18 @@ export const loadAtlas = createServerFn({ method: "GET" }).handler(
       url: string | null;
       published_on: string | null;
       kind: string;
+      site_count: number;
     }>`
-      select slug, title, url, published_on::text as published_on, kind
-      from sources
-      order by published_on nulls last, title
+      select src.slug, src.title, src.url, src.published_on::text as published_on, src.kind,
+        count(ss.site_id)::int as site_count
+      from sources src
+      left join site_sources ss on ss.source_id = src.id
+      group by src.id, src.slug, src.title, src.url, src.published_on, src.kind
+      order by src.published_on nulls last, src.title
     `;
 
-    const siteSources = await sql<{ site_id: number; source_slug: string }>`
-      select ss.site_id, src.slug as source_slug
+    const siteSources = await sql<{ site_id: number; source_slug: string; role: string }>`
+      select ss.site_id, src.slug as source_slug, ss.role
       from site_sources ss
       join sources src on src.id = ss.source_id
     `;
@@ -299,8 +357,111 @@ export const loadAtlas = createServerFn({ method: "GET" }).handler(
       order by sort
     `;
 
+    const flags = await sql<{ site_id: number; flag: string; note: string | null }>`
+      select site_id, flag, note from site_flags
+    `;
+
+    const relations = await sql<{
+      site_a: number;
+      site_b: number;
+      kind: string;
+      note: string | null;
+    }>`
+      select site_a, site_b, kind, note from site_relations
+    `;
+
+    const eras = await sql<{
+      slug: string;
+      label: string;
+      started_on: string | null;
+      ended_on: string | null;
+      blurb: string | null;
+    }>`
+      select slug, label, started_on::text as started_on, ended_on::text as ended_on, blurb
+      from eras
+      order by sort
+    `;
+
     const n = networks[0];
     if (!n) throw new Error("Network row missing — seed did not apply.");
+
+    const flagsBySite = new Map<number, string[]>();
+    for (const f of flags) {
+      const list = flagsBySite.get(f.site_id) ?? [];
+      list.push(f.flag);
+      flagsBySite.set(f.site_id, list);
+    }
+    const sourceCountBySite = new Map<number, number>();
+    for (const l of siteSources) {
+      sourceCountBySite.set(l.site_id, (sourceCountBySite.get(l.site_id) ?? 0) + 1);
+    }
+
+    const mappedSites: SiteListItem[] = sites.map((s) => ({
+      id: s.id,
+      code: s.code,
+      kindSlug: s.kind_slug,
+      kindLabel: s.kind_label,
+      ownershipSlug: s.ownership_slug,
+      ownershipLabel: s.ownership_label,
+      clusterSlug: s.cluster_slug,
+      clusterLabel: s.cluster_label,
+      label: s.label,
+      street: s.street,
+      civic: s.civic,
+      postalCode: s.postal_code,
+      municipality: s.municipality,
+      provinceCode: s.province_code,
+      provinceName: s.province_name,
+      lat: Number(s.lat),
+      lon: Number(s.lon),
+      geocodeMethod: s.geocode_method,
+      phone: s.phone,
+      phonesExtra: s.phones_extra,
+      partnerName: s.partner_name,
+      openedOn: s.opened_on,
+      areaSqm: s.area_sqm,
+      parkingSpots: s.parking_spots,
+      staffCount: s.staff_count,
+      notes: s.notes,
+      confidenceSlug: s.confidence_slug,
+      confidenceLabel: s.confidence_label,
+      osmUrl: s.osm_url,
+      mapPreviewUrl: s.map_preview_url,
+      status: s.status,
+      servedByHubSlug: s.served_by_hub,
+      servedByHubLabel: s.served_by_hub_label,
+      giftCard: Boolean(s.gift_card),
+      flags: flagsBySite.get(s.id) ?? [],
+      sourceCount: sourceCountBySite.get(s.id) ?? 0,
+      kmFromHub: null,
+    }));
+
+    const hubSite = mappedSites.find((s) => s.kindSlug === "warehouse");
+    if (hubSite) {
+      for (const s of mappedSites) {
+        if (s.kindSlug === "warehouse") continue;
+        s.kmFromHub = Math.round(haversineKm(s.lat, s.lon, hubSite.lat, hubSite.lon));
+      }
+    }
+
+    const stores = mappedSites.filter((s) => s.kindSlug === "store");
+    const coverage: Coverage = {
+      sites: mappedSites.length,
+      stores: stores.length,
+      warehouses: mappedSites.filter((s) => s.kindSlug === "warehouse").length,
+      giftCard: mappedSites.filter((s) => s.giftCard).length,
+      verified: mappedSites.filter((s) => s.confidenceSlug === "verified").length,
+      probable: mappedSites.filter((s) => s.confidenceSlug === "probable").length,
+      approximate: mappedSites.filter((s) => s.confidenceSlug === "approximate").length,
+      withPhone: mappedSites.filter((s) => Boolean(s.phone)).length,
+      withOpenedOn: mappedSites.filter((s) => Boolean(s.openedOn)).length,
+      withArea: mappedSites.filter((s) => s.areaSqm != null).length,
+      withPartner: mappedSites.filter((s) => Boolean(s.partnerName)).length,
+      unoEx: mappedSites.filter((s) => s.flags.includes("uno_ex")).length,
+      postGiftcard: mappedSites.filter((s) => s.flags.includes("post_giftcard")).length,
+      sourceLinks: siteSources.length,
+      sources: sources.length,
+    };
 
     return {
       network: {
@@ -312,41 +473,7 @@ export const loadAtlas = createServerFn({ method: "GET" }).handler(
         foundedYear: n.founded_year,
         notes: n.notes,
       },
-      sites: sites.map((s) => ({
-        id: s.id,
-        code: s.code,
-        kindSlug: s.kind_slug,
-        kindLabel: s.kind_label,
-        ownershipSlug: s.ownership_slug,
-        ownershipLabel: s.ownership_label,
-        clusterSlug: s.cluster_slug,
-        clusterLabel: s.cluster_label,
-        label: s.label,
-        street: s.street,
-        civic: s.civic,
-        postalCode: s.postal_code,
-        municipality: s.municipality,
-        provinceCode: s.province_code,
-        provinceName: s.province_name,
-        lat: Number(s.lat),
-        lon: Number(s.lon),
-        geocodeMethod: s.geocode_method,
-        phone: s.phone,
-        phonesExtra: s.phones_extra,
-        partnerName: s.partner_name,
-        openedOn: s.opened_on,
-        areaSqm: s.area_sqm,
-        parkingSpots: s.parking_spots,
-        staffCount: s.staff_count,
-        notes: s.notes,
-        confidenceSlug: s.confidence_slug,
-        confidenceLabel: s.confidence_label,
-        osmUrl: s.osm_url,
-        mapPreviewUrl: s.map_preview_url,
-        status: s.status,
-        servedByHubSlug: s.served_by_hub,
-        servedByHubLabel: s.served_by_hub_label,
-      })),
+      sites: mappedSites,
       provinces: provinces.map((p) => ({
         code: p.code,
         name: p.name,
@@ -389,10 +516,12 @@ export const loadAtlas = createServerFn({ method: "GET" }).handler(
         url: s.url,
         publishedOn: s.published_on,
         kind: s.kind,
+        siteCount: s.site_count,
       })),
       siteSources: siteSources.map((s) => ({
         siteId: s.site_id,
         sourceSlug: s.source_slug,
+        role: s.role,
       })),
       hubs: hubs.map((h) => ({
         slug: h.slug,
@@ -425,6 +554,25 @@ export const loadAtlas = createServerFn({ method: "GET" }).handler(
         label: f.label,
         blurb: f.blurb,
       })),
+      flags: flags.map((f) => ({
+        siteId: f.site_id,
+        flag: f.flag,
+        note: f.note,
+      })),
+      relations: relations.map((r) => ({
+        siteA: r.site_a,
+        siteB: r.site_b,
+        kind: r.kind,
+        note: r.note,
+      })),
+      eras: eras.map((e) => ({
+        slug: e.slug,
+        label: e.label,
+        startedOn: e.started_on,
+        endedOn: e.ended_on,
+        blurb: e.blurb,
+      })),
+      coverage,
     };
   },
 );

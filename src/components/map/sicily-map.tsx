@@ -10,6 +10,12 @@ export type FlowSegment = {
   to: [number, number];
 };
 
+export type HubRings = {
+  lat: number;
+  lon: number;
+  km: number[];
+};
+
 type Props = {
   sites: SiteListItem[];
   selectedId: number | null;
@@ -17,6 +23,8 @@ type Props = {
   basemap: Basemap;
   flowLines?: FlowSegment[];
   accentHubId?: number | null;
+  rings?: HubRings | null;
+  fitToken?: string;
 };
 
 type Layers = {
@@ -59,7 +67,8 @@ function pinClass(site: SiteListItem, active: boolean, hubAccent: boolean) {
         ? "is-aff"
         : "is-store";
   const extra = hubAccent && site.kindSlug !== "warehouse" ? " is-fed" : "";
-  return `atlas-pin ${kind}${active ? " is-active" : ""}${extra}`;
+  const recon = !site.giftCard && site.kindSlug !== "warehouse" ? " is-recon" : "";
+  return `atlas-pin ${kind}${active ? " is-active" : ""}${extra}${recon}`;
 }
 
 function applyBasemap(
@@ -85,6 +94,8 @@ export function SicilyMap({
   basemap,
   flowLines = [],
   accentHubId = null,
+  rings = null,
+  fitToken = "",
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
@@ -92,6 +103,8 @@ export function SicilyMap({
   const basemapRef = useRef(basemap);
   const markersRef = useRef<Map<number, import("leaflet").Marker>>(new Map());
   const flowsRef = useRef<import("leaflet").Polyline[]>([]);
+  const ringsRef = useRef<import("leaflet").Circle[]>([]);
+  const lastFitRef = useRef<string | null>(null);
   const onSelectRef = useRef(onSelect);
   const [epoch, setEpoch] = useState(0);
   onSelectRef.current = onSelect;
@@ -213,6 +226,48 @@ export function SicilyMap({
       disposed = true;
     };
   }, [flowLines, epoch]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !epoch) return;
+    let disposed = false;
+    (async () => {
+      const L = await import("leaflet");
+      if (disposed || !mapRef.current) return;
+      for (const c of ringsRef.current) c.remove();
+      ringsRef.current = [];
+      if (!rings) return;
+      for (const km of rings.km) {
+        const circle = L.circle([rings.lat, rings.lon], {
+          radius: km * 1000,
+          color: "#c45c4a",
+          weight: 1,
+          opacity: 0.55,
+          fill: false,
+          dashArray: "4 8",
+          interactive: false,
+        }).addTo(map);
+        ringsRef.current.push(circle);
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [rings, epoch]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !epoch) return;
+    if (lastFitRef.current === null) {
+      lastFitRef.current = fitToken;
+      return;
+    }
+    if (lastFitRef.current === fitToken) return;
+    lastFitRef.current = fitToken;
+    if (sites.length === 0) return;
+    const bounds = sites.map((s) => [s.lat, s.lon] as [number, number]);
+    map.fitBounds(bounds, { padding: [36, 36], maxZoom: 12 });
+  }, [fitToken, sites, epoch]);
 
   useEffect(() => {
     const map = mapRef.current;

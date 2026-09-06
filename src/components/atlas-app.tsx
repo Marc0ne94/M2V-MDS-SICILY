@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Building2,
   ChevronRight,
+  CircleDot,
+  Download,
+  Link2,
   MapPin,
   Search,
   Truck,
@@ -14,11 +17,75 @@ import type {
   LogisticsHub,
   SiteListItem,
 } from "@/lib/atlas";
-import { SicilyMap, type FlowSegment } from "@/components/map/sicily-map";
+import { SicilyMap, type FlowSegment, type HubRings } from "@/components/map/sicily-map";
 import { cn } from "@/lib/utils";
 
-type Tab = "siti" | "flussi" | "dossier" | "rete";
+type Tab = "siti" | "flussi" | "fonti" | "dossier" | "rete";
 type Basemap = "street" | "aerial";
+type DocFilter = "all" | "gift" | "uno" | "verified" | "gaps";
+
+const REL_LABEL: Record<string, string> = {
+  possible_same: "Possibile stesso sito",
+  possible_relocation: "Possibile trasferimento",
+  distinct_homonym: "Omonimo distinto",
+};
+
+const FLAG_LABEL: Record<string, string> = {
+  uno_ex: "Ex Uno 2019",
+  post_giftcard: "Dopo il PDF",
+  toponym_conflict: "Toponimo discordante",
+  possible_duplicate: "Possibile doppio",
+  possible_relocation: "Possibile trasferimento",
+  wave_2019: "Ondata 2019",
+};
+
+const ROLE_LABEL: Record<string, string> = {
+  gift_card: "Gift card",
+  press: "Stampa",
+  corporate: "Societaria",
+  directory: "Directory",
+  supporting: "Di contesto",
+};
+
+const KIND_LABEL: Record<string, string> = {
+  corporate: "Societarie",
+  press: "Stampa",
+  reference: "Riferimento",
+  directory: "Directory",
+  web: "Web",
+};
+
+function missing(v: string | number | null | undefined) {
+  return v == null || v === "" ? "non in fonti" : String(v);
+}
+
+function exportGeojson(sites: SiteListItem[]) {
+  const fc = {
+    type: "FeatureCollection",
+    features: sites.map((s) => ({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+      properties: {
+        code: s.code,
+        label: s.label,
+        kind: s.kindSlug,
+        municipality: s.municipality,
+        province: s.provinceCode,
+        giftCard: s.giftCard,
+        confidence: s.confidenceSlug,
+        street: s.street,
+        kmFromHub: s.kmFromHub,
+      },
+    })),
+  };
+  const blob = new Blob([JSON.stringify(fc, null, 2)], { type: "application/geo+json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "atlante-sicilia.geojson";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 function formatAddress(s: SiteListItem) {
   const line = [s.street, s.civic].filter(Boolean).join(" ");
@@ -34,6 +101,8 @@ function MapMount(props: {
   basemap: Basemap;
   flowLines: FlowSegment[];
   accentHubId: number | null;
+  rings: HubRings | null;
+  fitToken: string;
 }) {
   const [on, setOn] = useState(false);
   useEffect(() => setOn(true), []);
@@ -106,14 +175,51 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
   const [province, setProvince] = useState<string>("all");
   const [kind, setKind] = useState<string>("all");
   const [cluster, setCluster] = useState<string>("all");
-  const [recent, setRecent] = useState(false);
+  const [era, setEra] = useState<string>("all");
+  const [doc, setDoc] = useState<DocFilter>("all");
+  const [sourceSlug, setSourceSlug] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [hubSlug, setHubSlug] = useState<string | null>(null);
   const [mobileList, setMobileList] = useState(false);
   const [basemap, setBasemap] = useState<Basemap>("street");
+  const [showRings, setShowRings] = useState(false);
+
+  useEffect(() => {
+    const raw = window.location.hash.replace(/^#s=/i, "");
+    if (!raw) return;
+    const site = atlas.sites.find((s) => s.code.toLowerCase() === raw.toLowerCase());
+    if (site) {
+      setSelectedId(site.id);
+      if (site.kindSlug === "warehouse") {
+        const hub = atlas.hubs.find((h) => h.siteCode === site.code);
+        setHubSlug(hub?.slug ?? null);
+      }
+    }
+    // mount-only: open shared pin from hash
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const hashReady = useRef(false);
+  useEffect(() => {
+    if (!hashReady.current) {
+      hashReady.current = true;
+      return;
+    }
+    const site = atlas.sites.find((s) => s.id === selectedId);
+    history.replaceState(
+      null,
+      "",
+      site ? `#s=${site.code}` : window.location.pathname,
+    );
+  }, [atlas.sites, selectedId]);
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
+    const sourceIds = sourceSlug
+      ? new Set(
+          atlas.siteSources.filter((l) => l.sourceSlug === sourceSlug).map((l) => l.siteId),
+        )
+      : null;
     return atlas.sites.filter((s) => {
       if (province !== "all" && s.provinceCode !== province) return false;
       if (cluster !== "all" && s.clusterSlug !== cluster) return false;
@@ -121,29 +227,38 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
       if (kind === "store" && s.kindSlug !== "store") return false;
       if (kind === "affiliated" && s.ownershipSlug !== "affiliated") return false;
       if (kind === "direct" && s.ownershipSlug !== "direct") return false;
-      if (recent && (!s.openedOn || s.openedOn < "2020-01-01")) return false;
+      if (era === "gift-2025" && !s.giftCard) return false;
+      if (era === "uno-2019" && !s.flags.includes("uno_ex") && !s.flags.includes("wave_2019"))
+        return false;
+      if (era === "post-pdf" && !s.flags.includes("post_giftcard")) return false;
+      if (doc === "gift" && !s.giftCard) return false;
+      if (doc === "uno" && !s.flags.includes("uno_ex")) return false;
+      if (doc === "verified" && s.confidenceSlug !== "verified") return false;
+      if (doc === "gaps" && s.phone && s.openedOn && s.sourceCount > 0) return false;
+      if (sourceIds && !sourceIds.has(s.id)) return false;
       if (!needle) return true;
       const hay = `${s.label} ${s.municipality} ${s.street ?? ""} ${s.code}`.toLowerCase();
       return hay.includes(needle);
     });
-  }, [atlas.sites, q, province, kind, cluster, recent]);
+  }, [atlas.sites, atlas.siteSources, q, province, kind, cluster, era, doc, sourceSlug]);
 
   const selected = atlas.sites.find((s) => s.id === selectedId) ?? null;
   const selectedHub = atlas.hubs.find((h) => h.slug === hubSlug) ?? null;
   const selectedEvents = selected
     ? atlas.events.filter((e) => e.siteId === selected.id)
     : [];
-  const selectedSources = selected
-    ? atlas.sources.filter((src) =>
-        atlas.siteSources.some((l) => l.siteId === selected.id && l.sourceSlug === src.slug),
-      )
-    : [];
 
   const stores = atlas.sites.filter((s) => s.kindSlug === "store").length;
-  const sicilyHubs = atlas.sites.filter((s) => s.kindSlug === "warehouse").length;
   const lastStat = atlas.stats[atlas.stats.length - 1];
   const warehouse = atlas.sites.find((s) => s.kindSlug === "warehouse") ?? null;
   const activeHubs = atlas.hubs.filter((h) => h.status === "active").length;
+
+  const rings = useMemo<HubRings | null>(() => {
+    if (!showRings || !warehouse) return null;
+    return { lat: warehouse.lat, lon: warehouse.lon, km: [50, 100, 150] };
+  }, [showRings, warehouse]);
+
+  const fitToken = `${era}|${doc}|${sourceSlug ?? ""}|${province}|${cluster}|${kind}|${q}`;
 
   const flowLines = useMemo<FlowSegment[]>(() => {
     if (!warehouse || selectedHub?.onSicilyMap !== true) return [];
@@ -179,6 +294,39 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
     setMobileList(false);
   }
 
+  function pickSource(slug: string) {
+    setSourceSlug((prev) => (prev === slug ? null : slug));
+    setEra("all");
+    setDoc("all");
+    setTab("fonti");
+    setMobileList(false);
+  }
+
+  const related = selected
+    ? atlas.relations
+        .filter((r) => r.siteA === selected.id || r.siteB === selected.id)
+        .map((r) => {
+          const otherId = r.siteA === selected.id ? r.siteB : r.siteA;
+          const other = atlas.sites.find((s) => s.id === otherId);
+          return { ...r, other };
+        })
+        .filter((r) => r.other)
+    : [];
+
+  const selectedSource = atlas.sources.find((s) => s.slug === sourceSlug) ?? null;
+  const selectedFlagNotes = selected
+    ? atlas.flags.filter((f) => f.siteId === selected.id)
+    : [];
+  const selectedSourceLinks = selected
+    ? atlas.siteSources
+        .filter((l) => l.siteId === selected.id)
+        .map((l) => {
+          const src = atlas.sources.find((s) => s.slug === l.sourceSlug);
+          return src ? { ...src, role: l.role } : null;
+        })
+        .filter((x): x is AtlasSource & { role: string } => x != null)
+    : [];
+
   return (
     <div className="flex h-dvh min-h-0 flex-col bg-bg text-fg">
       <header className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-4 py-3 md:px-6">
@@ -189,11 +337,13 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
           <h1 className="truncate font-display text-xl font-medium tracking-tight md:text-2xl">
             {atlas.network.brandName} Sicilia
           </h1>
+          <p className="mt-0.5 hidden truncate text-[11px] text-subtle md:block">
+            Ricostruzione da fonti pubbliche · non un elenco ufficiale
+          </p>
         </div>
         <div className="hidden items-end gap-6 text-right md:flex">
           <Stat k="Siti mappati" v={String(atlas.sites.length)} />
-          <Stat k="Punti vendita" v={String(stores)} />
-          <Stat k="Hub isolano" v={String(sicilyHubs)} />
+          <Stat k="Gift card" v={String(atlas.coverage.giftCard)} />
           <Stat k="Ce.Di. attivi" v={String(activeHubs)} />
           <Stat k="Rete dichiarata" v={lastStat ? String(lastStat.reportedCount) : "—"} />
         </div>
@@ -214,7 +364,7 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
           )}
         >
           <div className="flex items-center gap-1 border-b border-border p-2">
-            {(["siti", "flussi", "dossier", "rete"] as const).map((t) => (
+            {(["siti", "flussi", "fonti", "dossier", "rete"] as const).map((t) => (
               <button
                 key={t}
                 type="button"
@@ -248,8 +398,10 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
               setKind={setKind}
               cluster={cluster}
               setCluster={setCluster}
-              recent={recent}
-              setRecent={setRecent}
+              era={era}
+              setEra={setEra}
+              doc={doc}
+              setDoc={setDoc}
               filtered={filtered}
               selectedId={selectedId}
               onPick={pick}
@@ -263,7 +415,25 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
               servedCount={stores}
             />
           ) : null}
-          {tab === "dossier" ? <DossierPane atlas={atlas} /> : null}
+          {tab === "fonti" ? (
+            <FontiPane
+              atlas={atlas}
+              sourceSlug={sourceSlug}
+              onPickSource={pickSource}
+              visible={filtered.length}
+            />
+          ) : null}
+          {tab === "dossier" ? (
+            <DossierPane
+              atlas={atlas}
+              onPick={pick}
+              onPickSource={pickSource}
+              onProvince={(code) => {
+                setProvince(code);
+                setTab("siti");
+              }}
+            />
+          ) : null}
           {tab === "rete" ? (
             <OrgPane atlas={atlas} onPickHub={pickHub} />
           ) : null}
@@ -277,35 +447,89 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
             basemap={basemap}
             flowLines={flowLines}
             accentHubId={selectedHub?.onSicilyMap ? warehouse?.id ?? null : null}
+            rings={rings}
+            fitToken={fitToken}
           />
-          <div className="pointer-events-none absolute top-3 right-3 z-10 md:top-4 md:right-4">
-            <div className="pointer-events-auto inline-flex overflow-hidden rounded-md border border-border bg-bg/90 text-[11px] tracking-wide uppercase">
+          <div className="pointer-events-none absolute top-3 left-3 right-16 z-10 md:top-4 md:left-4">
+            <div className="pointer-events-auto flex flex-wrap gap-1">
+              {atlas.eras.map((e) => (
+                <button
+                  key={e.slug}
+                  type="button"
+                  onClick={() => {
+                    setEra(e.slug);
+                    setSourceSlug(null);
+                  }}
+                  className={cn(
+                    "rounded-full border px-2.5 py-1 text-[11px]",
+                    era === e.slug
+                      ? "border-accent bg-bg text-fg"
+                      : "border-border bg-bg/80 text-muted",
+                  )}
+                >
+                  {e.label}
+                </button>
+              ))}
+            </div>
+            {selectedSource ? (
               <button
                 type="button"
-                className={cn(
-                  "px-3 py-2",
-                  basemap === "street" ? "bg-elevated text-fg" : "text-muted",
-                )}
-                onClick={() => setBasemap("street")}
+                onClick={() => setSourceSlug(null)}
+                className="pointer-events-auto mt-1 max-w-sm rounded-md border border-border bg-bg/90 px-2 py-1 text-left text-[11px] text-muted"
               >
-                Carta
+                Fonte: {selectedSource.title} · {filtered.length} pin · togli filtro
               </button>
+            ) : null}
+          </div>
+          <div className="pointer-events-none absolute top-3 right-3 z-10 md:top-4 md:right-4">
+            <div className="pointer-events-auto flex flex-col items-end gap-1">
+              <div className="inline-flex overflow-hidden rounded-md border border-border bg-bg/90 text-[11px] tracking-wide uppercase">
+                <button
+                  type="button"
+                  className={cn(
+                    "px-3 py-2",
+                    basemap === "street" ? "bg-elevated text-fg" : "text-muted",
+                  )}
+                  onClick={() => setBasemap("street")}
+                >
+                  Carta
+                </button>
+                <button
+                  type="button"
+                  className={cn(
+                    "px-3 py-2",
+                    basemap === "aerial" ? "bg-elevated text-fg" : "text-muted",
+                  )}
+                  onClick={() => setBasemap("aerial")}
+                >
+                  Satellite
+                </button>
+              </div>
               <button
                 type="button"
+                onClick={() => setShowRings((x) => !x)}
                 className={cn(
-                  "px-3 py-2",
-                  basemap === "aerial" ? "bg-elevated text-fg" : "text-muted",
+                  "pointer-events-auto inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[11px]",
+                  showRings
+                    ? "border-accent bg-bg text-fg"
+                    : "border-border bg-bg/90 text-muted",
                 )}
-                onClick={() => setBasemap("aerial")}
               >
-                Satellite
+                <CircleDot className="size-3" />
+                Raggio Ce.Di.
               </button>
             </div>
           </div>
           <div className="pointer-events-none absolute bottom-3 left-3 right-3 flex flex-wrap gap-2 md:bottom-4 md:left-4">
-            <LegendDot className="bg-mark-store" label="Punto vendita" />
+            <LegendDot className="bg-mark-store" label="Gift card" />
+            <LegendDot className="border border-mark-store bg-transparent" label="Ricostruito" />
             <LegendDot className="bg-mark-aff" label="Affiliato" />
             <LegendDot className="bg-mark-hub" label="Centro distributivo" />
+            {showRings ? (
+              <span className="pointer-events-auto inline-flex items-center gap-2 rounded-md border border-border bg-bg/80 px-2 py-1 text-[11px] text-muted">
+                Cerchi 50 / 100 / 150 km
+              </span>
+            ) : null}
           </div>
         </section>
 
@@ -321,9 +545,12 @@ export function AtlasApp({ atlas }: { atlas: AtlasPayload }) {
             <SitePanel
               site={selected}
               events={selectedEvents}
-              sources={selectedSources}
+              sources={selectedSourceLinks}
               brand={atlas.network.brandName}
               servedCount={stores}
+              related={related}
+              flagNotes={selectedFlagNotes}
+              onPickRelated={pick}
               onClose={() => {
                 setSelectedId(null);
                 setHubSlug(null);
@@ -379,8 +606,10 @@ function SitesPane({
   setKind,
   cluster,
   setCluster,
-  recent,
-  setRecent,
+  era,
+  setEra,
+  doc,
+  setDoc,
   filtered,
   selectedId,
   onPick,
@@ -394,8 +623,10 @@ function SitesPane({
   setKind: (v: string) => void;
   cluster: string;
   setCluster: (v: string) => void;
-  recent: boolean;
-  setRecent: (v: boolean) => void;
+  era: string;
+  setEra: (v: string) => void;
+  doc: DocFilter;
+  setDoc: (v: DocFilter) => void;
   filtered: SiteListItem[];
   selectedId: number | null;
   onPick: (id: number) => void;
@@ -426,6 +657,20 @@ function SitesPane({
             ))}
           </select>
           <select
+            value={cluster}
+            onChange={(e) => setCluster(e.target.value)}
+            className="min-w-0 flex-1 rounded-md border border-border bg-elevated px-2 py-2 text-xs text-fg"
+          >
+            <option value="all">Tutti i cluster</option>
+            {atlas.clusters.map((c) => (
+              <option key={c.slug} value={c.slug}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex gap-2">
+          <select
             value={kind}
             onChange={(e) => setKind(e.target.value)}
             className="min-w-0 flex-1 rounded-md border border-border bg-elevated px-2 py-2 text-xs text-fg"
@@ -436,48 +681,53 @@ function SitesPane({
             <option value="direct">Diretti</option>
             <option value="affiliated">Affiliati</option>
           </select>
+          <select
+            value={era}
+            onChange={(e) => setEra(e.target.value)}
+            className="min-w-0 flex-1 rounded-md border border-border bg-elevated px-2 py-2 text-xs text-fg"
+          >
+            {atlas.eras.map((e) => (
+              <option key={e.slug} value={e.slug}>
+                {e.label}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="flex flex-wrap gap-1.5">
-          <button
-            type="button"
-            onClick={() => setCluster("all")}
-            className={cn(
-              "rounded-full border px-2.5 py-1 text-[11px]",
-              cluster === "all"
-                ? "border-accent bg-elevated text-fg"
-                : "border-border text-muted",
-            )}
-          >
-            Tutti i cluster
-          </button>
-          {atlas.clusters.map((c) => (
+          {(
+            [
+              ["all", "Tutti"],
+              ["gift", "Gift card"],
+              ["uno", "Ex Uno"],
+              ["verified", "Verificati"],
+              ["gaps", "Campi vuoti"],
+            ] as const
+          ).map(([id, label]) => (
             <button
-              key={c.slug}
+              key={id}
               type="button"
-              onClick={() => setCluster(c.slug)}
+              onClick={() => setDoc(id)}
               className={cn(
                 "rounded-full border px-2.5 py-1 text-[11px]",
-                cluster === c.slug
-                  ? "border-accent bg-elevated text-fg"
-                  : "border-border text-muted",
+                doc === id ? "border-accent bg-elevated text-fg" : "border-border text-muted",
               )}
             >
-              {c.label}
+              {label}
             </button>
           ))}
+        </div>
+        <p className="flex items-center justify-between gap-2 font-mono text-[11px] text-subtle tabular-nums">
+          <span>
+            {filtered.length} visibili · {atlas.coverage.giftCard} in PDF gift card
+          </span>
           <button
             type="button"
-            onClick={() => setRecent(!recent)}
-            className={cn(
-              "rounded-full border px-2.5 py-1 text-[11px]",
-              recent ? "border-accent bg-elevated text-fg" : "border-border text-muted",
-            )}
+            onClick={() => exportGeojson(filtered)}
+            className="inline-flex items-center gap-1 text-muted hover:text-fg"
           >
-            Aperture dal 2020
+            <Download className="size-3" />
+            GeoJSON
           </button>
-        </div>
-        <p className="font-mono text-[11px] text-subtle tabular-nums">
-          {filtered.length} visibili
         </p>
       </div>
       <ul className="min-h-0 flex-1 overflow-y-auto">
@@ -501,6 +751,8 @@ function SitesPane({
                 <span className="block truncate text-xs text-muted">
                   {s.municipality} · {s.provinceCode}
                   {s.openedOn ? ` · ${s.openedOn.slice(0, 4)}` : ""}
+                  {s.giftCard ? " · gift" : ""}
+                  {s.sourceCount ? ` · ${s.sourceCount} fonti` : " · senza fonte"}
                 </span>
               </span>
               <ChevronRight className="mt-0.5 size-4 shrink-0 text-subtle" />
@@ -688,10 +940,188 @@ function ItalySchematic({
   );
 }
 
-function DossierPane({ atlas }: { atlas: AtlasPayload }) {
+
+function FontiPane({
+  atlas,
+  sourceSlug,
+  onPickSource,
+  visible,
+}: {
+  atlas: AtlasPayload;
+  sourceSlug: string | null;
+  onPickSource: (slug: string) => void;
+  visible: number;
+}) {
+  const kinds = [...new Set(atlas.sources.map((s) => s.kind))];
   return (
     <div className="min-h-0 flex-1 overflow-y-auto p-4">
-      <p className="text-xs tracking-wide text-muted uppercase">Conteggi dichiarati</p>
+      <p className="text-xs tracking-wide text-muted uppercase">Provenienza</p>
+      <p className="mt-2 text-sm leading-relaxed text-muted">
+        Ogni pin è agganciato a fonti in tabella, con un ruolo. Clicca una fonte
+        per filtrare la mappa. Il PDF gift card è ufficiale ma sottoinsieme;
+        lo store locator non è un dump per scheda. Siamo certi delle fonti
+        collegate, non della completezza della rete.
+      </p>
+      <p className="mt-2 font-mono text-[11px] text-subtle tabular-nums">
+        {atlas.coverage.sourceLinks} legami · {atlas.coverage.sources} fonti · {visible} pin visibili
+      </p>
+      {kinds.map((k) => (
+        <div key={k} className="mt-5">
+          <h3 className="text-[11px] tracking-wide text-subtle uppercase">
+            {KIND_LABEL[k] ?? k}
+          </h3>
+          <ul className="mt-2 space-y-2">
+            {atlas.sources
+              .filter((s) => s.kind === k)
+              .map((s) => (
+                <li key={s.slug}>
+                  <div
+                    className={cn(
+                      "w-full rounded-lg border p-3 text-left",
+                      sourceSlug === s.slug
+                        ? "border-accent bg-elevated"
+                        : "border-border bg-elevated/40 hover:bg-elevated",
+                    )}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onPickSource(s.slug)}
+                      className="w-full text-left"
+                    >
+                      <div className="text-sm font-medium">{s.title}</div>
+                      <div className="mt-1 font-mono text-[11px] text-subtle">
+                        {s.siteCount} schede
+                        {s.publishedOn ? ` · ${s.publishedOn}` : ""}
+                      </div>
+                    </button>
+                    {s.url ? (
+                      <a
+                        href={s.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-1 inline-block text-[11px] text-accent underline-offset-4 hover:underline"
+                      >
+                        Apri originale
+                      </a>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Meter({
+  label,
+  num,
+  den,
+}: {
+  label: string;
+  num: number;
+  den: number;
+}) {
+  const pct = den ? Math.round((num / den) * 100) : 0;
+  return (
+    <div>
+      <div className="flex justify-between gap-2 text-[11px] tracking-wide uppercase">
+        <span className="text-subtle">{label}</span>
+        <span className="font-mono text-muted tabular-nums">
+          {num}/{den} · {pct}%
+        </span>
+      </div>
+      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-elevated">
+        <div className="h-full rounded-full bg-accent" style={{ width: `${Math.min(100, pct)}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function DossierPane({
+  atlas,
+  onPick,
+  onPickSource,
+  onProvince,
+}: {
+  atlas: AtlasPayload;
+  onPick: (id: number) => void;
+  onPickSource: (slug: string) => void;
+  onProvince: (code: string) => void;
+}) {
+  const cov = atlas.coverage;
+  const last = atlas.stats[atlas.stats.length - 1];
+  const chrono = [
+    ...atlas.stats.map((st) => ({
+      date: st.asOf,
+      title: `Rete dichiarata: ${st.reportedCount}`,
+      body: st.note,
+      siteId: null as number | null,
+    })),
+    ...atlas.events.map((e) => ({
+      date: e.occurredOn ?? "",
+      title: e.title,
+      body: e.body,
+      siteId: e.siteId,
+    })),
+  ].sort((a, b) => a.date.localeCompare(b.date));
+  const provinces = [...atlas.provinces].sort((a, b) => b.siteCount - a.siteCount);
+  const maxP = Math.max(1, ...provinces.map((p) => p.siteCount));
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto p-4">
+      <p className="text-xs tracking-wide text-muted uppercase">Certezza</p>
+      <p className="mt-2 text-sm leading-relaxed text-muted">
+        Siamo certi delle fonti collegate a ogni pin, non della completezza
+        della rete. Non è un dump ufficiale: è una ricostruzione. I campi vuoti
+        restano vuoti — non inventiamo zeri.
+      </p>
+      <div className="mt-4 space-y-3">
+        <Meter label="In PDF gift card" num={cov.giftCard} den={cov.stores} />
+        <Meter label="Geocoding verificato" num={cov.verified} den={cov.sites} />
+        <Meter label="Con telefono" num={cov.withPhone} den={cov.sites} />
+        <Meter label="Con data di apertura" num={cov.withOpenedOn} den={cov.sites} />
+        <Meter label="Con superficie" num={cov.withArea} den={cov.sites} />
+        <Meter label="Ex Uno 2019" num={cov.unoEx} den={cov.stores} />
+        {last ? (
+          <Meter
+            label="Mappati vs dichiarati"
+            num={cov.stores}
+            den={last.reportedCount}
+          />
+        ) : null}
+      </div>
+      <p className="mt-2 text-[11px] leading-relaxed text-subtle">
+        I mappati possono superare i dichiarati: gift card, stampa e directory
+        si sovrappongono in modo diverso, e restano coppie da verificare.
+      </p>
+
+      <p className="mt-8 text-xs tracking-wide text-muted uppercase">Per provincia</p>
+      <ul className="mt-3 space-y-2">
+        {provinces.map((p) => (
+          <li key={p.code}>
+            <button
+              type="button"
+              onClick={() => onProvince(p.code)}
+              className="w-full text-left"
+            >
+              <div className="flex justify-between text-[11px] tracking-wide uppercase">
+                <span className="text-muted">{p.name}</span>
+                <span className="font-mono text-subtle tabular-nums">{p.siteCount}</span>
+              </div>
+              <div className="mt-1 h-1 overflow-hidden rounded-full bg-elevated">
+                <div
+                  className="h-full rounded-full bg-accent"
+                  style={{ width: `${(p.siteCount / maxP) * 100}%` }}
+                />
+              </div>
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      <p className="mt-8 text-xs tracking-wide text-muted uppercase">Conteggi dichiarati</p>
       <ol className="mt-3 space-y-3">
         {atlas.stats.map((st) => (
           <li key={st.asOf} className="border-l border-border pl-3">
@@ -701,10 +1131,35 @@ function DossierPane({ atlas }: { atlas: AtlasPayload }) {
           </li>
         ))}
       </ol>
+
+      <p className="mt-8 text-xs tracking-wide text-muted uppercase">Cronologia</p>
+      <ol className="mt-3 space-y-3">
+        {chrono.map((ev, i) => (
+          <li key={`${ev.date}-${ev.title}-${i}`} className="border-l border-border pl-3">
+            <div className="font-mono text-[11px] text-subtle">{ev.date || "data non in fonti"}</div>
+            {ev.siteId != null ? (
+              <button
+                type="button"
+                onClick={() => onPick(ev.siteId!)}
+                className="text-left text-sm font-medium hover:underline"
+              >
+                {ev.title}
+              </button>
+            ) : (
+              <div className="text-sm font-medium">{ev.title}</div>
+            )}
+            {ev.body ? <p className="text-xs text-muted">{ev.body}</p> : null}
+          </li>
+        ))}
+      </ol>
+
       <div className="mt-8 space-y-6">
         {atlas.notes.map((n) => (
           <article key={n.slug}>
             <h2 className="font-display text-lg">{n.title}</h2>
+            {n.asOf ? (
+              <p className="mt-1 font-mono text-[11px] text-subtle">{n.asOf}</p>
+            ) : null}
             <p className="mt-2 text-sm leading-relaxed text-muted">{n.body}</p>
           </article>
         ))}
@@ -714,21 +1169,17 @@ function DossierPane({ atlas }: { atlas: AtlasPayload }) {
         <ul className="mt-3 space-y-2">
           {atlas.sources.map((s) => (
             <li key={s.slug} className="text-xs leading-relaxed">
-              {s.url ? (
-                <a
-                  href={s.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-accent underline-offset-4 hover:underline"
-                >
-                  {s.title}
-                </a>
-              ) : (
-                <span>{s.title}</span>
-              )}
+              <button
+                type="button"
+                onClick={() => onPickSource(s.slug)}
+                className="text-left text-accent underline-offset-4 hover:underline"
+              >
+                {s.title}
+              </button>
               <span className="ml-2 text-subtle">
-                {s.kind}
+                {KIND_LABEL[s.kind] ?? s.kind}
                 {s.publishedOn ? ` · ${s.publishedOn}` : ""}
+                {` · ${s.siteCount} schede`}
               </span>
             </li>
           ))}
@@ -795,6 +1246,8 @@ function OrgPane({
 }
 
 function EmptyDossier({ atlas }: { atlas: AtlasPayload }) {
+  const cov = atlas.coverage;
+  const last = atlas.stats[atlas.stats.length - 1];
   return (
     <div className="hidden h-full flex-col justify-between p-6 md:flex">
       <div>
@@ -804,9 +1257,17 @@ function EmptyDossier({ atlas }: { atlas: AtlasPayload }) {
         <h2 className="mt-2 font-display text-2xl">Scheda sito</h2>
         <p className="mt-3 text-sm leading-relaxed text-muted">{atlas.network.notes}</p>
         <p className="mt-4 text-sm leading-relaxed text-muted">
-          Non è un dump ufficiale della rete: è una ricostruzione da pagine societarie,
-          PDF gift card, stampa GDO e directory, con livello di confidenza su ogni pin.
+          Non è un dump ufficiale della rete: è una ricostruzione da pagine
+          societarie, PDF gift card, stampa GDO e directory. Siamo certi delle
+          fonti agganciate, non della completezza.
         </p>
+        <div className="mt-6 space-y-3">
+          <Meter label="In PDF gift card" num={cov.giftCard} den={cov.stores} />
+          <Meter label="Geocoding verificato" num={cov.verified} den={cov.sites} />
+          {last ? (
+            <Meter label="Mappati vs dichiarati" num={cov.stores} den={last.reportedCount} />
+          ) : null}
+        </div>
       </div>
       <p className="text-xs text-subtle">
         Coordinate da OpenStreetMap / Photon. Viste aeree Esri. Estratti OSM (ODbL).
@@ -911,17 +1372,45 @@ function SitePanel({
   sources,
   brand,
   servedCount,
+  related,
+  flagNotes,
+  onPickRelated,
   onClose,
   onOpenHub,
 }: {
   site: SiteListItem;
   events: AtlasPayload["events"];
-  sources: AtlasSource[];
+  sources: (AtlasSource & { role: string })[];
   brand: string;
   servedCount: number;
+  related: { kind: string; note: string | null; other?: SiteListItem }[];
+  flagNotes: { flag: string; note: string | null }[];
+  onPickRelated: (id: number) => void;
   onClose: () => void;
   onOpenHub?: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
+  const anag = [
+    site.phone,
+    site.openedOn,
+    site.areaSqm,
+    site.parkingSpots,
+    site.staffCount,
+    site.partnerName,
+  ];
+  const filled = anag.filter((v) => v != null && v !== "").length;
+
+  async function copyLink() {
+    const url = `${window.location.origin}${window.location.pathname}#s=${site.code}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   return (
     <div className="p-4 md:p-5">
       <div className="flex items-start justify-between gap-3">
@@ -931,17 +1420,54 @@ function SitePanel({
           </p>
           <h2 className="mt-1 font-display text-2xl leading-tight">{site.label}</h2>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="rounded-md border border-border p-2 text-muted hover:text-fg"
-          aria-label="Chiudi scheda"
-        >
-          <X className="size-4" />
-        </button>
+        <div className="flex gap-1">
+          <button
+            type="button"
+            onClick={copyLink}
+            className="rounded-md border border-border p-2 text-muted hover:text-fg"
+            aria-label="Copia collegamento"
+          >
+            <Link2 className="size-4" />
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-border p-2 text-muted hover:text-fg"
+            aria-label="Chiudi scheda"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
       </div>
+      {copied ? (
+        <p className="mt-2 text-[11px] text-muted">Collegamento copiato</p>
+      ) : null}
 
       <p className="mt-3 text-sm text-muted">{formatAddress(site)}</p>
+
+      <div className="mt-3 flex flex-wrap gap-1.5">
+        {site.giftCard ? (
+          <span className="rounded-full border border-accent px-2 py-0.5 text-[11px]">
+            Gift card 2025
+          </span>
+        ) : (
+          <span className="rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
+            Non in PDF
+          </span>
+        )}
+        <span className="rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
+          {site.confidenceLabel}
+        </span>
+        {site.flags.map((f) => (
+          <span
+            key={f}
+            className="rounded-full border border-border px-2 py-0.5 text-[11px] text-muted"
+          >
+            {FLAG_LABEL[f] ?? f}
+          </span>
+        ))}
+      </div>
+
       <div className="mt-4 space-y-2">
         <AerialStill lat={site.lat} lon={site.lon} label={site.label} />
         <StreetStill lat={site.lat} lon={site.lon} label={site.label} />
@@ -950,15 +1476,24 @@ function SitePanel({
       <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
         <Fact k="Insegna" v={brand} />
         <Fact k="Codice" v={site.code} />
-        <Fact k="Telefono" v={site.phone ?? "—"} />
-        <Fact k="Apertura" v={site.openedOn ?? "—"} />
-        <Fact k="Superficie" v={site.areaSqm ? `${site.areaSqm} mq` : "—"} />
-        <Fact k="Personale" v={site.staffCount ? String(site.staffCount) : "—"} />
-        <Fact k="Parcheggi" v={site.parkingSpots ? String(site.parkingSpots) : "—"} />
+        <Fact k="Telefono" v={missing(site.phone)} />
+        <Fact k="Apertura" v={missing(site.openedOn)} />
+        <Fact k="Superficie" v={site.areaSqm ? `${site.areaSqm} mq` : "non in fonti"} />
+        <Fact k="Personale" v={missing(site.staffCount)} />
+        <Fact k="Parcheggi" v={missing(site.parkingSpots)} />
         <Fact k="Confidenza" v={site.confidenceLabel} />
-        <Fact k="Cluster" v={site.clusterLabel ?? "—"} />
+        <Fact k="Cluster" v={site.clusterLabel ?? "non in fonti"} />
         <Fact k="Geocoding" v={site.geocodeMethod} />
+        <Fact
+          k="Dal Ce.Di."
+          v={site.kmFromHub != null ? `${site.kmFromHub} km` : "—"}
+        />
+        <Fact k="Fonti" v={String(site.sourceCount)} />
       </dl>
+
+      <p className="mt-3 font-mono text-[11px] text-subtle">
+        Anagrafica {filled}/6 campi · i vuoti sono assenze documentate
+      </p>
 
       {site.kindSlug === "warehouse" ? (
         <p className="mt-4 text-sm text-muted">
@@ -986,13 +1521,52 @@ function SitePanel({
         <p className="mt-4 text-sm leading-relaxed text-muted">{site.notes}</p>
       ) : null}
 
+      {flagNotes.length ? (
+        <div className="mt-4 space-y-2">
+          {flagNotes
+            .filter((f) => f.note)
+            .map((f) => (
+              <p key={f.flag} className="text-xs leading-relaxed text-muted">
+                {FLAG_LABEL[f.flag] ?? f.flag}: {f.note}
+              </p>
+            ))}
+        </div>
+      ) : null}
+
+      {related.length ? (
+        <div className="mt-6">
+          <h3 className="text-xs tracking-wide text-muted uppercase">Schede collegate</h3>
+          <ul className="mt-2 space-y-2">
+            {related.map((r) =>
+              r.other ? (
+                <li key={`${r.kind}-${r.other.id}`}>
+                  <button
+                    type="button"
+                    onClick={() => onPickRelated(r.other!.id)}
+                    className="w-full rounded-md border border-border bg-elevated px-3 py-2 text-left"
+                  >
+                    <div className="text-[11px] tracking-wide text-subtle uppercase">
+                      {REL_LABEL[r.kind] ?? r.kind}
+                    </div>
+                    <div className="text-sm font-medium">{r.other.label}</div>
+                    {r.note ? <p className="mt-1 text-xs text-muted">{r.note}</p> : null}
+                  </button>
+                </li>
+              ) : null,
+            )}
+          </ul>
+        </div>
+      ) : null}
+
       {events.length ? (
         <div className="mt-6">
           <h3 className="text-xs tracking-wide text-muted uppercase">Cronologia</h3>
           <ol className="mt-2 space-y-3">
             {events.map((e) => (
               <li key={`${e.occurredOn}-${e.title}`} className="border-l border-border pl-3">
-                <div className="font-mono text-[11px] text-subtle">{e.occurredOn}</div>
+                <div className="font-mono text-[11px] text-subtle">
+                  {e.occurredOn ?? "data non in fonti"}
+                </div>
                 <div className="text-sm font-medium">{e.title}</div>
                 {e.body ? <p className="text-xs text-muted">{e.body}</p> : null}
               </li>
@@ -1001,9 +1575,9 @@ function SitePanel({
         </div>
       ) : null}
 
-      {sources.length ? (
-        <div className="mt-6">
-          <h3 className="text-xs tracking-wide text-muted uppercase">Fonti della scheda</h3>
+      <div className="mt-6">
+        <h3 className="text-xs tracking-wide text-muted uppercase">Fonti della scheda</h3>
+        {sources.length ? (
           <ul className="mt-2 space-y-1">
             {sources.map((s) => (
               <li key={s.slug} className="text-xs">
@@ -1019,11 +1593,18 @@ function SitePanel({
                 ) : (
                   s.title
                 )}
+                <span className="ml-2 text-subtle">
+                  {ROLE_LABEL[s.role] ?? s.role}
+                </span>
               </li>
             ))}
           </ul>
-        </div>
-      ) : null}
+        ) : (
+          <p className="mt-2 text-xs text-muted">
+            Nessuna fonte per-scheda. Il pin resta in dossier con confidenza {site.confidenceLabel}.
+          </p>
+        )}
+      </div>
 
       {site.osmUrl ? (
         <a
